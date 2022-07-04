@@ -51,7 +51,7 @@ parser.add_argument("--repr_type", default='block_graph')
 parser.add_argument("--model_version", default='v4')
 parser.add_argument("--run", default=0, help="run", type=int)
 parser.add_argument("--save_path", default='results/')
-parser.add_argument("--proxy_path", default='./data/pretrained_proxy')
+parser.add_argument("--proxy_path", default='/home/ewanlee/Codes/gflownet/mols/data/pretrained_proxy')
 parser.add_argument("--print_array_length", default=False, action='store_true')
 parser.add_argument("--progress", default='yes')
 parser.add_argument("--floatX", default='float64')
@@ -59,7 +59,7 @@ parser.add_argument("--include_nblocks", default=False)
 parser.add_argument("--balanced_loss", default=True)
 parser.add_argument("--early_stop_reg", default=0.1, type=float)
 parser.add_argument("--initial_log_Z", default=30, type=float)
-parser.add_argument("--objective", default='fm', type=str)
+parser.add_argument("--objective", default='tb', type=str) # fm
 # If True this basically implements Buesing et al's TreeSample Q/SoftQLearning, samples uniformly
 # from it though, no MCTS involved
 parser.add_argument("--ignore_parents", default=False)
@@ -458,8 +458,8 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
     dataset.set_sampling_model(model, proxy, sample_prob=args.sample_prob)
 
     def save_stuff(iter):
-        corr_logp = compute_correlation(model, dataset.mdp, args)
-        pickle.dump(corr_logp, gzip.open(f'{exp_dir}/{iter}_model_logp_pred.pkl.gz', 'wb'))
+        # corr_logp = compute_correlation(model, dataset.mdp, args)
+        # pickle.dump(corr_logp, gzip.open(f'{exp_dir}/{iter}_model_logp_pred.pkl.gz', 'wb'))
 
         pickle.dump([i.data.cpu().numpy() for i in model.parameters()],
                     gzip.open(f'{exp_dir}/' + str(iter) + '_params.pkl.gz', 'wb'))
@@ -642,7 +642,8 @@ def train_model_with_proxy(args, model, proxy, dataset, num_steps=None, do_save=
 
 
 def main(args):
-    bpath = "data/blocks_PDB_105.json"
+    # bpath = "data/blocks_PDB_105.json"
+    bpath = "/home/ewanlee/Codes/gflownet/mols/data/blocks_PDB_105.json"
     device = torch.device('cuda')
     print(args)
 
@@ -730,6 +731,7 @@ def compute_correlation(model, mdp, args):
     tf = lambda x: torch.tensor(x, device=device).to(args.floatX)
     tint = lambda x: torch.tensor(x, device=device).long()
 
+    # TODO: bug: test_mols do not exists!!!
     test_mols = pickle.load(gzip.open('data/some_mols_U_1k.pkl.gz'))
     logsoftmax = nn.LogSoftmax(0)
     logp = []
@@ -789,7 +791,7 @@ def compute_correlation(model, mdp, args):
 
     
 try:
-    from arrays import*
+    from arrays import *
 except:
     print("no arrays")
 
