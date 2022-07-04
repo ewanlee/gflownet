@@ -18,13 +18,16 @@ from torch.distributions.categorical import Categorical
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--save_path", default='results/flow_insp_0.pkl.gz', type=str)
+# change path to trajectory balance loss
+parser.add_argument("--save_path", default='results/flow_tb_insp_0.pkl.gz', type=str)
 parser.add_argument("--device", default='cpu', type=str)
 parser.add_argument("--progress", action='store_true')
 
 #
-parser.add_argument("--method", default='flownet', type=str)
-parser.add_argument("--learning_rate", default=1e-4, help="Learning rate", type=float)
+parser.add_argument("--method", default='flownet_tb', type=str)
+# parser.add_argument("--method", default='flownet', type=str)
+parser.add_argument("--learning_rate", default=1e-3, help="Learning rate", type=float)
+parser.add_argument("--learning_rate_z", default=0.1, help="Learning rate of Z", type=float)
 parser.add_argument("--opt", default='adam', type=str)
 parser.add_argument("--adam_beta1", default=0.9, type=float)
 parser.add_argument("--adam_beta2", default=0.999, type=float)
@@ -41,39 +44,31 @@ parser.add_argument('--func', default='corners')
 parser.add_argument("--horizon", default=8, type=int)
 parser.add_argument("--ndim", default=2, type=int)
 
-# MCMC
-parser.add_argument("--bufsize", default=16, help="MCMC buffer size", type=int)
-
-# Flownet
+# Flownet (Trajectory Balance)
 parser.add_argument("--bootstrap_tau", default=0., type=float)
 parser.add_argument("--replay_strategy", default='none', type=str) # top_k none
 parser.add_argument("--replay_sample_size", default=2, type=int)
 parser.add_argument("--replay_buf_size", default=100, type=float)
-
-# PPO
-parser.add_argument("--ppo_num_epochs", default=32, type=int) # number of SGD steps per epoch
-parser.add_argument("--ppo_epoch_size", default=16, type=int) # number of sampled minibatches per epoch
-parser.add_argument("--ppo_clip", default=0.2, type=float)
-parser.add_argument("--ppo_entropy_coef", default=1e-1, type=float)
 parser.add_argument("--clip_grad_norm", default=0., type=float)
+parser.add_argument("--uniform_pb", default=False, type=bool)
 
-# SAC
-parser.add_argument("--sac_alpha", default=0.98*np.log(1/3), type=float)
-
-
+# MCMC
+parser.add_argument("--bufsize", default=16, help="MCMC buffer size", type=int)
 
 
 _dev = [torch.device('cpu')]
 tf = lambda x: torch.FloatTensor(x).to(_dev[0])
 tl = lambda x: torch.LongTensor(x).to(_dev[0])
+tb = lambda x: torch.BoolTensor(x).to(_dev[0])
 
 def set_device(dev):
     _dev[0] = dev
 
 
-def func_corners(x):
+def func_corners(x, log=False):
     ax = abs(x)
-    return (ax > 0.5).prod(-1) * 0.5 + ((ax < 0.8) * (ax > 0.6)).prod(-1) * 2 + 1e-1
+    reward = (ax > 0.5).prod(-1) * 0.5 + ((ax < 0.8) * (ax > 0.6)).prod(-1) * 2 + 1e-1
+    return np.log(reward) if log else reward
 
 def func_corners_floor_B(x):
     ax = abs(x)
@@ -89,7 +84,7 @@ def func_cos_N(x):
 
 class GridEnv:
 
-    def __init__(self, horizon, ndim=2, xrange=[-1, 1], func=None, allow_backward=False):
+    def __init__(self, horizon, ndim=2, xrange=[-1, 1], func=None, log_reward=False, allow_backward=False):
         self.horizon = horizon
         self.start = [xrange[0]] * ndim # [0, 0]
         self.ndim = ndim
@@ -97,6 +92,7 @@ class GridEnv:
         self.func = (
             (lambda x: ((np.cos(x * 50) + 1) * norm.pdf(x * 5)).prod(-1) + 0.01)
             if func is None else func)
+        self.log_reward = log_reward
         self.xspace = np.linspace(*xrange, horizon)
         self.allow_backward = allow_backward  # If true then this is a
                                               # MCMC ergodic env,
@@ -115,7 +111,7 @@ class GridEnv:
     def reset(self):
         self._state = np.int32([0] * self.ndim)
         self._step = 0
-        return self.obs(), self.func(self.s2x(self._state)), self._state
+        return self.obs(), self.func(self.s2x(self._state), self.log_reward), self._state
 
     def parent_transitions(self, s, used_stop_action):
         if used_stop_action:
@@ -138,16 +134,20 @@ class GridEnv:
         return self.step_dag(a, s)
 
     def step_dag(self, a, s=None):
+        # return (obs, reward, done, state)
         _s = s
         s = (self._state if s is None else s) + 0
         if a < self.ndim:
             s[a] += 1
 
-        done = s.max() >= self.horizon - 1 or a == self.ndim
+        if not self.log_reward:
+            done = s.max() >= self.horizon - 1 or a == self.ndim
+        else:
+            done = a == self.ndim
         if _s is None:
             self._state = s
             self._step += 1
-        return self.obs(s), 0 if not done else self.func(self.s2x(s)), done, s
+        return self.obs(s), 0 if not done else self.func(self.s2x(s), self.log_reward), done, s
 
     def step_chain(self, a, s=None):
         _s = s
@@ -163,7 +163,7 @@ class GridEnv:
         if _s is None:
             self._state = s
             self._step += 1
-        return self.obs(s), self.func(self.s2x(s)), s, reverse_a
+        return self.obs(s), self.func(self.s2x(s), self.log_reward), s, reverse_a
 
     def true_density(self):
         if self._true_density is not None:
@@ -185,6 +185,7 @@ class GridEnv:
                                for s in all_int_states])
         all_xs = (np.float32(all_int_states) / (self.horizon-1) *
                   (self.xspace[-1] - self.xspace[0]) + self.xspace[0])
+        # TODO: log_reward?
         traj_rewards = self.func(all_xs) * state_mask
         true_density = traj_rewards / traj_rewards.sum()
         return true_density
@@ -241,6 +242,7 @@ class GridEnv:
         # Let's compute the reward as well
         all_xs = (np.float32(all_int_states) / (self.horizon-1) *
                   (self.xspace[-1] - self.xspace[0]) + self.xspace[0])
+        # TODO: log_reward?
         traj_rewards = self.func(all_xs)[state_mask]
         # All the states as the agent sees them:
         all_int_obs = np.float32([self.obs(i) for i in all_int_states])
@@ -270,6 +272,7 @@ class ReplayBuffer:
     def sample(self):
         if not len(self.buf):
             return []
+        print('I am here!')
         idxs = np.random.randint(0, len(self.buf), self.sample_size)
         return sum([self.generate_backward(*self.buf[i]) for i in idxs], [])
 
@@ -364,6 +367,122 @@ class FlowNetAgent:
 
         return loss, term_loss, flow_loss
 
+class TBAgent:
+    def __init__(self, args, envs):
+        # forward and backward model are represented by a universal neural network
+        self.model = make_mlp([args.horizon * args.ndim] +
+                              [args.n_hid] * args.n_layers +
+                              [2*args.ndim+1])
+        self.model.to(args.dev)
+        self.Z = torch.zeros((1,)).to(args.dev)
+        # self.target = copy.deepcopy(self.model)
+        self.args = args
+        self.envs = envs
+        self.ndim = args.ndim
+        # self.tau = args.bootstrap_tau
+        self.replay = ReplayBuffer(args, envs[0])
+
+    def parameters(self):
+        return (self.model.parameters(), self.Z)
+
+    def sample_many(self, mbsize, all_visited):
+        batch = []
+        batch += self.replay.sample()
+        s = tf([i.reset()[0] for i in self.envs])
+        coords = tf([i.reset()[-1] for i in self.envs])
+        done = tb([False] * mbsize)
+
+        acts = None
+        terminate_states = []
+
+        ll_diff = torch.zeros((mbsize,)).to(_dev[0])
+        ll_diff += self.Z
+
+        i = 0 # the timestep of batch_size parallel episodes
+        while not all(done):
+            pred = self.model(s)
+
+            # for forward model, the coordinate can not greater than (horizon-1)
+            # for forward terminating action, current episode can not be termiated already
+            edge_mask = torch.cat([(coords >= self.args.horizon-1).float(),
+                            torch.zeros(((~done).sum(), 1), device=_dev[0])], 1)
+            logits = (pred[..., : self.ndim + 1] - 1000000000 * edge_mask).log_softmax(1)
+            # for backward model, the coordinate can not less than 0
+            init_edge_mask = (coords == 0).float()
+            back_logits = ((0 if self.args.uniform_pb else 1) *
+                        pred[..., self.ndim + 1 : 2 * self.ndim + 1] - \
+                            1000000000 * init_edge_mask).log_softmax(1)
+
+            if acts is not None:
+                ll_diff[~done] -= back_logits.gather(1, acts[acts != self.ndim].unsqueeze(1)).squeeze(1)
+
+            exp_weight = 0.
+            temp = 1
+            # \epsilon-greedy policy, but exp_weight == 0
+            sample_ins_probs = (1 - exp_weight) * (logits / temp).softmax(1) + exp_weight * \
+                (1 - edge_mask) / (1 - edge_mask + 0.0000001).sum(1).unsqueeze(1)
+
+            acts = sample_ins_probs.multinomial(1)
+            ll_diff[~done] += logits.gather(1, acts).squeeze(1)
+
+            # Note to self: this is ugly, ugly code
+            # with torch.no_grad():
+            #     acts = Categorical(logits=self.model(s)).sample()
+            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
+            # p_a = [self.envs[0].parent_transitions(sp_state, a == self.ndim)
+            #        for a, (sp, r, done, sp_state) in zip(acts, step)]
+            # batch += [[tf(i) for i in (p, a, [r], [sp], [d])]
+            #           for (p, a), (sp, r, d, _) in zip(p_a, step)]
+            c = count(0)
+            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            done = tb([bool(d or step[m[i]][2]) for i, d in enumerate(done)])
+            s = tf([i[0] for i in step if not i[2]])
+            coords = tf([i[-1] for i in step if not i[2]])
+            for (_, r, d, sp) in step:
+                if d:
+                    all_visited.append(tuple(sp))
+                    terminate_states.append(sp)
+                    self.replay.add(tuple(sp), r)
+        return ll_diff, terminate_states
+
+
+    def learn_from(self, it, batch):
+
+        total_loss = 0
+
+        for bat in batch:
+            ll_diff, z = bat
+            lr = tf([i.func(i.s2x(z[t].astype(float)), i.log_reward) \
+                for t, i in enumerate(self.envs)])
+            ll_diff -= lr
+            total_loss += (ll_diff ** 2).sum() / len(ll_diff)
+            
+        return [total_loss]
+
+        # loginf = tf([1000])
+        # batch_idxs = tl(sum([[i]*len(parents) for i, (parents,_,_,_,_) in enumerate(batch)], []))
+        # parents, actions, r, sp, done = map(torch.cat, zip(*batch))
+        # parents_Qsa = self.model(parents)[torch.arange(parents.shape[0]), actions.long()]
+        # in_flow = torch.log(torch.zeros((sp.shape[0],))
+        #                     .index_add_(0, batch_idxs, torch.exp(parents_Qsa)))
+        # if self.tau > 0:
+        #     with torch.no_grad(): next_q = self.target(sp)
+        # else:
+        #     next_q = self.model(sp)
+        # next_qd = next_q * (1-done).unsqueeze(1) + done.unsqueeze(1) * (-loginf)
+        # out_flow = torch.logsumexp(torch.cat([torch.log(r)[:, None], next_qd], 1), 1)
+        # loss = (in_flow - out_flow).pow(2).mean()
+
+        # with torch.no_grad():
+        #     term_loss = ((in_flow - out_flow) * done).pow(2).sum() / (done.sum() + 1e-20)
+        #     flow_loss = ((in_flow - out_flow) * (1-done)).pow(2).sum() / ((1-done).sum() + 1e-20)
+
+        # if self.tau > 0:
+        #     for a,b in zip(self.model.parameters(), self.target.parameters()):
+        #         b.data.mul_(1-self.tau).add_(self.tau*a)
+
+        # return loss, term_loss, flow_loss
+
 
 class SplitCategorical:
     def __init__(self, n, logits):
@@ -388,279 +507,26 @@ class SplitCategorical:
         return Categorical(probs=torch.cat([self.cats[0].probs, self.cats[1].probs],-1) * 0.5).entropy()
 
 
-class MARSAgent:
-    def __init__(self, args, envs):
-        self.model = make_mlp([args.horizon * args.ndim] +
-                              [args.n_hid] * args.n_layers +
-                              [args.ndim*2])
-        self.model.to(args.dev)
-        self.dataset = []
-        self.dataset_max = args.n_dataset_pts
-        self.mbsize = args.mbsize
-        self.envs = envs
-        self.batch = [i.reset() for i in envs] # The N MCMC chains
-        self.ndim = args.ndim
-        self.bufsize = args.bufsize
-
-    def parameters(self):
-        return self.model.parameters()
-
-    def sample_many(self, mbsize, all_visited):
-        s = torch.cat([tf([i[0]]) for i in self.batch])
-        r = torch.cat([tf([i[1]]) for i in self.batch])
-        with torch.no_grad(): logits = self.model(s)
-        pi = SplitCategorical(self.ndim, logits=logits)
-        a = pi.sample()
-        q_xpx = torch.exp(pi.log_prob(a))
-        steps = [self.envs[j].step(a[j].item(), s=self.batch[j][2]) for j in range(len(self.envs))]
-        sp = torch.cat([tf([i[0]]) for i in steps])
-        rp = torch.cat([tf([i[1]]) for i in steps])
-        with torch.no_grad(): logits_sp = self.model(sp)
-        reverse_a = tl([i[3] for i in steps])
-        pi_sp = SplitCategorical(self.ndim, logits=logits_sp)
-        q_xxp = torch.exp(pi.log_prob(reverse_a))
-        # This is the correct MH acceptance ratio:
-        #A = (rp * q_xxp) / (r * q_xpx + 1e-6)
-
-        # But the paper suggests to use this ratio, for reasons poorly
-        # explained... it does seem to actually work better? but still
-        # diverges sometimes. Idk
-        A = rp / r
-        U = torch.rand(self.bufsize)
-        for j in range(self.bufsize):
-            if A[j] > U[j]: # Accept
-                self.batch[j] = (sp[j].numpy(), rp[j].item(), steps[j][2])
-                all_visited.append(tuple(steps[j][2]))
-            # Added `or U[j] < 0.05` for stability in these toy settings
-            if rp[j] > r[j] or U[j] < 0.05: # Add to dataset
-                self.dataset.append((s[j].unsqueeze(0), a[j].unsqueeze(0)))
-        return [] # agent is stateful, no need to return minibatch data
-
-
-    def learn_from(self, i, data):
-        if not i % 20 and len(self.dataset) > self.dataset_max:
-            self.dataset = self.dataset[-self.dataset_max:]
-        if len(self.dataset) < self.mbsize:
-            return None
-        idxs = np.random.randint(0, len(self.dataset), self.mbsize)
-        s, a = map(torch.cat, zip(*[self.dataset[i] for i in idxs]))
-        logits = self.model(s)
-        pi = SplitCategorical(self.ndim, logits=logits)
-        q_xxp = pi.log_prob(a)
-        loss = -q_xxp.mean()+np.log(0.5)
-        # loss_p = loss  - pi.entropy().mean() * 0.1 # no, the entropy wasn't there in the paper
-        return loss, pi.entropy().mean()
-
-
-class MHAgent:
-    def __init__(self, args, envs):
-        self.envs = envs
-        self.batch = [i.reset() for i in envs] # The N MCMC chains
-        self.bufsize = args.bufsize
-        self.nactions = args.ndim*2
-        self.model = None
-
-    def parameters(self):
-        return []
-
-    def sample_many(self, mbsize, all_visited):
-        r = np.float32([i[1] for i in self.batch])
-        a = np.random.randint(0, self.nactions, self.bufsize)
-        steps = [self.envs[j].step(a[j], s=self.batch[j][2]) for j in range(self.bufsize)]
-        rp = np.float32([i[1] for i in steps])
-        A = rp / r
-        U = np.random.uniform(0,1,self.bufsize)
-        for j in range(self.bufsize):
-            if A[j] > U[j]: # Accept
-                self.batch[j] = (None, rp[j], steps[j][2])
-                all_visited.append(tuple(steps[j][2]))
-        return []
-
-    def learn_from(self, *a):
-        return None
-
-
-class PPOAgent:
-    def __init__(self, args, envs):
-        self.model = make_mlp([args.horizon * args.ndim] +
-                              [args.n_hid] * args.n_layers +
-                              [args.ndim+1+1]) # +1 for stop action, +1 for V
-        self.model.to(args.dev)
-        self.envs = envs
-        self.mbsize = args.mbsize
-        self.clip_param = args.ppo_clip
-        self.entropy_coef = args.ppo_entropy_coef
-
-    def parameters(self):
-        return self.model.parameters()
-
-    def sample_many(self, mbsize, all_visited):
-        batch = []
-        s = tf([i.reset()[0] for i in self.envs])
-        done = [False] * mbsize
-        trajs = defaultdict(list)
-        while not all(done):
-            # Note to self: this is ugly, ugly code as well
-            with torch.no_grad():
-                pol = Categorical(logits=self.model(s)[:, :-1])
-                acts = pol.sample()
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
-            log_probs = pol.log_prob(acts)
-            c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
-            for si, a, (sp, r, d, _), (traj_idx, _), lp in zip(s, acts, step, sorted(m.items()), log_probs):
-                trajs[traj_idx].append([si[None,:]] + [tf([i]) for i in (a, r, sp, d, lp)])
-            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
-            s = tf([i[0] for i in step if not i[2]])
-            for (_, r, d, sp) in step:
-                if d:
-                    all_visited.append(tuple(sp))
-        # Compute advantages
-        for tau in trajs.values():
-            s, a, r, sp, d, lp = [torch.cat(i, 0) for i in zip(*tau)]
-            with torch.no_grad():
-                vs = self.model(s)[:, -1]
-                vsp = self.model(sp)[:, -1]
-            adv = r + vsp * (1-d) - vs
-            for i, A in zip(tau, adv):
-                i.append(r[-1].unsqueeze(0)) # The return is always just the last reward, gamma is 1
-                i.append(A.unsqueeze(0))
-        return sum(trajs.values(), [])
-
-    def learn_from(self, it, batch):
-        idxs = np.random.randint(0, len(batch), self.mbsize)
-        s, a, r, sp, d, lp, G, A = [torch.cat(i, 0) for i in zip(*[batch[i] for i in idxs])]
-        o = self.model(s)
-        logits, values = o[:, :-1], o[:, -1]
-
-        new_pol = Categorical(logits=logits)
-        new_logprob = new_pol.log_prob(a)
-        ratio = torch.exp(new_logprob - lp)
-
-        surr1 = ratio * A
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_param,
-                            1.0 + self.clip_param) * A
-        action_loss = -torch.min(surr1, surr2).mean()
-        value_loss = 0.5 * (G - values).pow(2).mean()
-        entropy = new_pol.entropy().mean()
-        if not it % 100:
-            print(G.mean())
-        return (action_loss + value_loss - entropy * self.entropy_coef,
-                action_loss, value_loss, entropy)
-
-class RandomTrajAgent:
-    def __init__(self, args, envs):
-        self.mbsize = args.mbsize
-        self.envs = envs
-        self.nact = args.ndim + 1
-        self.model = None
-
-    def parameters(self):
-        return []
-
-    def sample_many(self, mbsize, all_visited):
-        batch = []
-        [i.reset()[0] for i in self.envs]
-        done = [False] * mbsize
-        trajs = defaultdict(list)
-        while not all(done):
-            acts = np.random.randint(0, self.nact, mbsize)
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
-            c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
-            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
-            for (_, r, d, sp) in step:
-                if d: all_visited.append(tuple(sp))
-        return []
-
-    def learn_from(self, it, batch):
-        return None
-
-class SACAgent:
-    def __init__(self, args, envs):
-        self.pol = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1],
-                            tail=[nn.Softmax(1)])
-        self.Q_1 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
-        self.Q_2 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
-        self.Q_t1 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
-        self.Q_t2 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
-        self.envs = envs
-        self.mbsize = args.mbsize
-        self.tau = args.bootstrap_tau
-        self.alpha = torch.tensor([args.sac_alpha], requires_grad=True)
-        self.alpha_target = args.sac_alpha
-
-    def parameters(self):
-        return (list(self.pol.parameters())+list(self.Q_1.parameters())+
-                list(self.Q_2.parameters()) + [self.alpha])
-
-    def sample_many(self, mbsize, all_visited):
-        batch = []
-        s = tf([i.reset()[0] for i in self.envs])
-        done = [False] * mbsize
-        trajs = defaultdict(list)
-        while not all(done):
-            with torch.no_grad():
-                pol = Categorical(probs=self.pol(s))
-                acts = pol.sample()
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
-            c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
-            for si, a, (sp, r, d, _), (traj_idx, _) in zip(s, acts, step, sorted(m.items())):
-                trajs[traj_idx].append([si[None,:]] + [tf([i]) for i in (a, r, sp, d)])
-            done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
-            s = tf([i[0] for i in step if not i[2]])
-            for (_, r, d, sp) in step:
-                if d: all_visited.append(tuple(sp))
-        return sum(trajs.values(), [])
-
-    def learn_from(self, it, batch):
-        s, a, r, sp, d = [torch.cat(i, 0) for i in zip(*batch)]
-        ar = torch.arange(s.shape[0])
-        a = a.long()
-        d = d.unsqueeze(1)
-        q1 = self.Q_1(s)
-        q1a = q1[ar, a]
-        q2 = self.Q_2(s)
-        q2a = q2[ar, a]
-        ps = self.pol(s)
-        with torch.no_grad():
-            qt1 = self.Q_t1(sp)
-            qt2 = self.Q_t2(sp)
-            psp = self.pol(sp)
-        vsp1 = ((1 - d) * psp * (qt1 - self.alpha * torch.log(psp))).sum(1)
-        vsp2 = ((1 - d) * psp * (qt2 - self.alpha * torch.log(psp))).sum(1)
-        J_Q = (0.5 * (q1a - r - vsp1).pow(2) + 0.5 * (q2a - r - vsp2).pow(2)).mean()
-        minq = torch.min(q1, q2).detach()
-        J_pi = (ps * (self.alpha * torch.log(ps) - minq)).sum(1).mean()
-        J_alpha = (ps.detach() * (-self.alpha * torch.log(ps.detach()) + self.alpha_target)).sum(1).mean()
-
-        if not it % 100:
-            print(ps[0].data, ps[-1].data, (ps * torch.log(ps)).sum(1).mean())
-        for A,B in [(self.Q_1, self.Q_t1), (self.Q_2, self.Q_t2)]:
-            for a,b in zip(A.parameters(), B.parameters()):
-                b.data.mul_(1-self.tau).add_(self.tau*a)
-        return J_Q + J_pi + J_alpha, J_Q, J_pi, J_alpha, self.alpha
-
 def make_opt(params, args):
     params = list(params)
     if not len(params):
         return None
     if args.opt == 'adam':
-        opt = torch.optim.Adam(params, args.learning_rate,
-                               betas=(args.adam_beta1, args.adam_beta2))
+        if len(params) == 1:
+            opt = torch.optim.Adam(params, args.learning_rate, 
+                                   betas=(args.adam_beta1, args.adam_beta2))
+        elif len(params) == 2: # trajectory balanced loss
+            opt = torch.optim.Adam(
+                [{'params': params[0], 'lr': args.learning_rate, 'betas': (args.adam_beta1, args.adam_beta2)},
+                {'params': params[1], 'lr': args.learning_rate_z, 'betas': (args.adam_beta1, args.adam_beta2)}]
+            )
+            params[1].requires_grad_()
+        else:
+            opt = torch.optim.Adam(params, args.learning_rate, 
+                                   betas=(args.adam_beta1, args.adam_beta2))
     elif args.opt == 'msgd':
-        opt = torch.optim.SGD(params, args.learning_rate, momentum=args.momentum)
+        raise NotImplementedError
+        # opt = torch.optim.SGD(params, args.learning_rate, momentum=args.momentum)
     return opt
 
 
@@ -706,23 +572,18 @@ def main(args):
 
     args.is_mcmc = args.method in ['mars', 'mcmc']
 
-    env = GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
-    envs = [GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
-            for i in range(args.bufsize)]
     ndim = args.ndim
 
     if args.method == 'flownet':
+        env = GridEnv(args.horizon, args.ndim, func=f, log_reward=False, allow_backward=args.is_mcmc)
+        envs = [GridEnv(args.horizon, args.ndim, func=f, log_reward=False, allow_backward=args.is_mcmc)
+            for _ in range(args.bufsize)]
         agent = FlowNetAgent(args, envs)
-    elif args.method == 'mars':
-        agent = MARSAgent(args, envs)
-    elif args.method == 'mcmc':
-        agent = MHAgent(args, envs)
-    elif args.method == 'ppo':
-        agent = PPOAgent(args, envs)
-    elif args.method == 'sac':
-        agent = SACAgent(args, envs)
-    elif args.method == 'random_traj':
-        agent = RandomTrajAgent(args, envs)
+    elif args.method == 'flownet_tb':
+        env = GridEnv(args.horizon, args.ndim, func=f, log_reward=True, allow_backward=args.is_mcmc)
+        envs = [GridEnv(args.horizon, args.ndim, func=f, log_reward=True, allow_backward=args.is_mcmc)
+            for _ in range(args.bufsize)]
+        agent = TBAgent(args, envs)
 
     opt = make_opt(agent.parameters(), args)
 
@@ -742,7 +603,10 @@ def main(args):
     for i in tqdm(range(args.n_train_steps+1), disable=not args.progress):
         data = []
         for j in range(sttr):
-            data += agent.sample_many(args.mbsize, all_visited)
+            if args.method == 'flownet_tb':
+                data.append(agent.sample_many(args.mbsize, all_visited))
+            elif args.method == 'flownet':
+                data += agent.sample_many(args.mbsize, all_visited)
         for j in range(ttsr):
             losses = agent.learn_from(i * ttsr + j, data) # returns (opt loss, *metrics)
             if losses is not None:
@@ -759,7 +623,13 @@ def main(args):
                 compute_empirical_distribution_error(env, all_visited[-args.num_empirical_loss:]))
             if args.progress:
                 k1, kl = empirical_distrib_losses[-1]
-                print('empirical L1 distance', k1, 'KL', kl, 'visited modes', visited_modes(env, np.int8(all_visited)))
+                if args.method == 'flownet_tb':
+                    print('empirical L1 distance', k1, 'KL', kl, 
+                        'visited modes', visited_modes(env, np.int8(all_visited)),
+                        'Z', agent.Z.item())
+                elif args.method == 'flownet':
+                    print('empirical L1 distance', k1, 'KL', kl, 
+                        'visited modes', visited_modes(env, np.int8(all_visited)))
                 if len(all_losses):
                     print(*[f'{np.mean([i[j] for i in all_losses[-100:]]):.5f}'
                             for j in range(len(all_losses[0]))])
